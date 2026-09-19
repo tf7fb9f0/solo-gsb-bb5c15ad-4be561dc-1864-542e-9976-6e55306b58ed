@@ -166,6 +166,74 @@ curl -s http://localhost:8000/api/v1/plans/a6df23c6-b019-79c7-2652-933b0d34d5e5
 按创建时间倒序返回摘要（`plan_id / status / created_at / panels_used /
 placed_parts / unplaced_parts`）及 `total`。
 
+### `POST /api/v1/plans/{plan_id}/gcode` — 导出已保存方案的 G-code
+
+针对**已保存**的方案（不存在返回 `404`）生成确定性的 G0/G1 切割程序。
+请求体：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `origin_corner` | string | 机床原点对应母板的角：`top_left` / `top_right` / `bottom_left` / `bottom_right` |
+| `units` | string | 输出单位：`mm`（输出 `G21`）或 `in`（输出 `G20`，按 1in=25.4mm 换算 X/Y） |
+| `safe_height` | number, >0 | 安全抬刀高度，与 `units` 同单位（Z 高度按给定值原样输出，不做单位换算） |
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/plans/$PLAN_ID/gcode \
+  -H 'Content-Type: application/json' \
+  -d '{"origin_corner": "bottom_left", "units": "mm", "safe_height": 8}'
+```
+
+响应：
+
+```jsonc
+{
+  "plan_id": "a6df23c6-…",
+  "units": "mm",
+  "origin_corner": "bottom_left",
+  "safe_height": 8.0,
+  "gcode": "%\n(plan_id: …)\n(units: mm)\n…\nM2\n%\n",
+  "line_map": [
+    // 源 panel_no/step 到 G-code 行号（从 1 开始）的映射
+    {"panel_no": 1, "step": 1, "axis": "V",
+     "start_line": 9, "line": 11, "end_line": 12}
+  ],
+  "total_cut_length": 883.0   // 切割路径总长（不含 G0 空程），单位同 units
+}
+```
+
+G-code 语义：
+
+- 程序头：`G17 G21/G20 G90 G94`（XY 平面 / 公制或英制 / 绝对坐标 / 每分钟进给），
+  随后 `G0 Z<safe_height>` 抬到安全高度；
+- **每刀固定四段**：`G0` 到起点（安全高度）→ `G1 Z0 F300` 下刀 →
+  `G1` 到终点切割（`F1000`；英制时进给同步换算）→ `G0 Z<safe_height>` 抬刀；
+- 方案坐标为左上原点、x 向右、y 向下；导出时按 `origin_corner` 做镜像/平移，
+  机床轴为 x 向右、y 向上（原点取上方两角时，板内 Y 坐标为负）。坐标变换
+  **同时作用于每刀的起点、终点和方向向量**，渲染前校验三者一致且长度不变；
+- **板间插入 `M0`**（换板暂停），程序以 `M2` 结束；`line_map` 给出每刀的
+  `start_line`（G0 定位）/`line`（G1 切割）/`end_line`（G0 抬刀）；
+- 相同方案与相同导出参数的输出**逐字符稳定**（无时间戳、无浮点数抖动）。
+
+导出前会重新做几何校验：每条切割线（含锯缝占位）必须在母板内、严格贯穿其
+`region`（起边对齐、长度等于区域跨度、刀线严格落在区域内部），`step` 从 1
+连续，母板编号连续。校验不通过时返回 `422` **结构化错误且不产生任何部分
+输出**（导出全程在内存中完成，不落任何文件）：
+
+```jsonc
+{
+  "error": "gcode_export_failed",
+  "code": "invalid_plan",
+  "message": "方案几何校验未通过，已拒绝导出（未生成任何文件）",
+  "plan_id": "a6df23c6-…",
+  "issues": [
+    {"type": "cut", "panel_no": 1, "step": 3,
+     "message": "竖切长度 80.0 未贯穿 region 高 100.0"}
+  ]
+}
+```
+
+参数非法（未知原点角、未知单位、`safe_height ≤ 0`、多余字段）同样返回 `422`。
+
 ### `GET /health`
 
 返回 `{"status":"ok"}`，供容器健康检查与负载均衡探活。
@@ -194,6 +262,10 @@ placed_parts / unplaced_parts`）及 `total`。
 “零件 ∪ 余料”、面积平衡（零件 + 余料 + 锯缝 = 母板面积）、零件不重叠不越界、
 数量守恒。任何自检失败都会直接报错而不会返回错误方案。
 
+G-code 导出在落库方案之上**再做一次同样的几何校验**（切割线在母板内、
+严格贯穿 region、step 连续），然后按所选机床原点角把方案坐标镜像/平移为
+机床坐标；详见上方 `POST /api/v1/plans/{plan_id}/gcode` 一节。
+
 ### 确定性
 
 - 零件实例按（最长边降序、面积降序、id、输入序号）固定排序；
@@ -209,13 +281,14 @@ placed_parts / unplaced_parts`）及 `total`。
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（创建/查询/列表/健康检查）+ 启动建库
+│   ├── main.py          # FastAPI 路由（创建/查询/列表/G-code 导出/健康检查）+ 启动建库
 │   ├── models.py        # 请求/响应 Pydantic 模型与参数校验
 │   ├── nesting.py       # 直切排样核心算法 + 几何自检 + 响应装配
-│   ├── services.py      # 业务编排、幂等落库
+│   ├── gcode.py         # G-code 导出：导出前校验 + 四角坐标变换 + 确定性 G0/G1 渲染
+│   ├── services.py      # 业务编排、幂等落库、导出编排
 │   ├── database.py      # SQLite 连接、建表、plan_id 摘要、CRUD
 │   └── init_db.py       # python -m app.init_db 建库入口
-├── tests/               # unittest：核心算法/随机不变量/持久化幂等/API 端到端
+├── tests/               # unittest：核心算法/随机不变量/持久化幂等/G-code 导出/API 端到端
 ├── entrypoint.sh        # 容器启动：建库 + uvicorn（一条命令）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -231,4 +304,6 @@ python3 -m unittest discover -s tests -v
 
 测试覆盖：恰好放满、锯缝切分、旋转启用/禁用、母板上限、超大件、编号连续、
 零锯缝铺满、**300 组随机算例的贯穿切模拟与面积/重叠/数量不变量**、
-结果稳定性（含输入乱序）、SQLite 幂等存取，以及基于 TestClient 的 HTTP 端到端。
+结果稳定性（含输入乱序）、SQLite 幂等存取，以及 G-code 导出的四角坐标变换
+（起点/终点/方向一致、长度不变）、mm/in 换算、板间 `M0`、行号映射、
+总切割长度、几何校验失败的结构化错误，和基于 TestClient 的 HTTP 端到端。

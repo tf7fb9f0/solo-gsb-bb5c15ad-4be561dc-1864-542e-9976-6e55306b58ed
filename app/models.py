@@ -1,7 +1,7 @@
 """请求与响应 Pydantic 模型（Pydantic v2）。"""
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator, ConfigDict
 
@@ -110,6 +110,57 @@ class PlanSummary(BaseModel):
 class PlanListResponse(BaseModel):
     total: int
     plans: list[PlanSummary]
+
+
+OriginCorner = Literal["top_left", "top_right", "bottom_left", "bottom_right"]
+ExportUnit = Literal["mm", "in"]
+
+
+class GcodeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    origin_corner: OriginCorner = Field(
+        ..., description="机床原点对应母板的角：左上/右上/左下/右下")
+    units: ExportUnit = Field(..., description="输出单位：mm（G21）或 in（G20）")
+    safe_height: float = Field(
+        ..., gt=0, le=10_000,
+        description="安全抬刀高度（与 units 同单位，>0）")
+
+
+class GcodeLineMapping(BaseModel):
+    panel_no: int
+    step: int
+    axis: Literal["V", "H"]
+    start_line: int = Field(..., description="该刀 G0 定位行号（从 1 开始）")
+    line: int = Field(..., description="该刀 G1 切割行号")
+    end_line: int = Field(..., description="该刀 G0 抬刀行号")
+
+
+class GcodeResponse(BaseModel):
+    plan_id: str
+    units: ExportUnit
+    origin_corner: OriginCorner
+    safe_height: float
+    gcode: str = Field(..., description="完整 G-code 文本（G0/G1，板间 M0，M2 结束）")
+    line_map: list[GcodeLineMapping] = Field(
+        ..., description="源 panel_no/step 到 G-code 行号的映射")
+    total_cut_length: float = Field(
+        ..., description="切割路径总长（不含 G0 空程，与 units 同单位）")
+
+
+class GcodeIssue(BaseModel):
+    type: Literal["plan", "panel", "cut"]
+    message: str
+    panel_no: Optional[int] = None
+    step: Optional[int] = None
+
+
+class GcodeError(BaseModel):
+    error: Literal["gcode_export_failed"] = "gcode_export_failed"
+    code: str = Field(..., description="机器可读错误码，如 invalid_plan")
+    message: str
+    plan_id: Optional[str] = None
+    issues: list[GcodeIssue] = []
 
 
 class HealthOut(BaseModel):

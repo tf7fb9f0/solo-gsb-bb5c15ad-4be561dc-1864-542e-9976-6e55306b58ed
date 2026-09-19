@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timezone
 
 from . import database as db
+from .gcode import render_gcode
 from .models import PlanRequest
 from .nesting import build_payload, solve
 
@@ -49,3 +50,21 @@ def create_plan(req_dict: dict) -> dict:
         db.save_plan(plan_id, request_json, json.dumps(payload, ensure_ascii=False),
                      payload["created_at"], conn)
         return payload
+
+
+def export_plan_gcode(plan_id: str, options: dict) -> dict:
+    """读取已保存方案并导出 G-code；方案不存在返回 None。
+
+    校验先于渲染且全部在内存中完成：方案异常时 gcode 模块抛出
+    GcodeExportError，由路由层转结构化错误，不会产生部分输出。
+    """
+    with db.get_conn() as conn:
+        payload = db.get_plan(plan_id, conn)
+    if payload is None:
+        return None
+    return render_gcode(
+        payload,
+        origin_corner=options["origin_corner"],
+        units=options["units"],
+        safe_height=options["safe_height"],
+    )
