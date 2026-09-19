@@ -3,12 +3,13 @@
 面向小型加工坊的矩形零件母板排样服务。输入母板尺寸、锯缝宽度、母板数量上限和
 **带数量与可旋转标记**的矩形零件，输出只由**贯穿当前余料区域的直切**
 （guillotine cut）组成、可直接上机执行的切割方案：每件零件落在第几号母板、
-坐标、朝向，以及按顺序编号的切割线和最终余料矩形。
+坐标、朝向，以及按顺序编号的切割线和最终余料矩形。已保存的方案可一键导出为
+确定性的机床 G-code（G0/G1 直切、板间 M0 换板）。
 
 - 语言/框架：Python 3.12 · FastAPI · Pydantic v2
 - 数据库：SQLite（单文件，WAL 模式，启动自动建库）
 - 保证：零件不重叠、不越界；锯缝实际占位；同输入稳定（确定性算法 + 幂等存储）；
-  排不下的零件以明确原因列出。
+  排不下的零件以明确原因列出；G-code 导出前逐刀几何校验，异常方案整体拒绝。
 
 ---
 
@@ -166,6 +167,109 @@ curl -s http://localhost:8000/api/v1/plans/a6df23c6-b019-79c7-2652-933b0d34d5e5
 按创建时间倒序返回摘要（`plan_id / status / created_at / panels_used /
 placed_parts / unplaced_parts`）及 `total`。
 
+### `POST /api/v1/plans/{plan_id}/gcode` — 导出方案的 G-code
+
+把**已保存**的方案按各母板 `cuts.step` 顺序翻译成确定性的 G0/G1 切割程序。
+相同方案 + 相同参数永远得到逐字节相同的文本（不含时间戳等易变量）。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `origin` | `top_left` / `top_right` / `bottom_left` / `bottom_right` | 机床原点所在的母板角 |
+| `unit` | `mm` / `in` | 输出单位（`mm`→`G21`，`in`→`G20`） |
+| `safe_z` | number, >0 | 安全抬刀高度（按 `unit` 计） |
+
+示例：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/plans/a6df23c6-b019-79c7-2652-933b0d34d5e5/gcode \
+  -H 'Content-Type: application/json' \
+  -d '{"origin": "bottom_left", "unit": "mm", "safe_z": 5}'
+```
+
+响应：
+
+```jsonc
+{
+  "plan_id": "a6df23c6-…",
+  "origin": "bottom_left",
+  "unit": "mm",
+  "safe_z": 5.0,
+  "line_count": 61,
+  "total_cut_length": 883.0,      // 全部切割线长度之和（按 unit 计）
+  "cut_map": [                    // 源 panel_no/step -> 该刀 G1 切割移动的行号（1 起）
+    {"panel_no": 1, "step": 1, "line": 12},
+    {"panel_no": 1, "step": 2, "line": 17}
+  ],
+  "gcode": "(PANEL-NESTING-API GCODE EXPORT)\n(PLAN a6df23c6-…)\n…M2\n"
+}
+```
+
+生成的程序（`origin=bottom_left, unit=mm, safe_z=5` 时）形如：
+
+```gcode
+(PANEL-NESTING-API GCODE EXPORT)
+(PLAN a6df23c6-…)
+(ORIGIN bottom_left; UNIT mm; SAFE_Z 5.000)
+G21
+G90
+G17
+G0 Z5.000
+(PANEL 1 OF 2: 244.000 X 122.000 mm)
+(P1 S1 V)
+G0 X120.000 Y122.000
+G1 Z0.000
+G1 X120.000 Y0.000
+G0 Z5.000
+…
+M0 (CHANGE TO PANEL 2)
+(PANEL 2 OF 2: 244.000 X 122.000 mm)
+…
+M2
+```
+
+**坐标变换**：排样坐标系以母板左上角为原点、x 向右、y 向下；机床坐标系以
+`origin` 指定的母板角为原点，X/Y 轴取向保证整块母板落在第一象限（坐标非负）。
+设板宽 W、板高 H，则 `(px, py)` 的映射为：
+
+| origin | (mx, my) |
+|---|---|
+| `top_left` | `(px, py)` |
+| `top_right` | `(W − px, py)` |
+| `bottom_left` | `(px, H − py)` |
+| `bottom_right` | `(W − px, H − py)` |
+
+同一变换同时作用于每刀的**起点、终点与走刀方向**（先由 `axis/x/y/length`
+得到线段两端点，再整体映射；镜像原点角会翻转对应轴的走刀方向）。`unit=in`
+时全部坐标与 `total_cut_length` 按 ÷25.4 换算；`safe_z` 直接按 `unit` 解释。
+
+**程序约定**：`G21/G20` 选单位、`G90` 绝对坐标、`G17` XY 平面；每刀一个块——
+`G0` 快速定位到起点 → `G1 Z0` 下刀到切割平面（工件坐标 Z0）→ `G1` 切到终点 →
+`G0` 抬刀到 `safe_z`；相邻母板之间插入 `M0` 暂停换板（仅板间，末尾不加）；
+程序以 `M2` 结束。注释 `(P<母板号> S<step> V|H)` 与 `cut_map` 一一对应。
+
+**导出前校验**：导出前逐刀校验——切割线（含两端点）仍在母板内、沿切割方向
+贯穿其 `region`、`region` 在母板内、`step` 从 1 连续编号。任何违规都**整体
+拒绝**并返回 `409`，不输出任何部分 G-code：
+
+```jsonc
+{
+  "detail": {
+    "error": "invalid_plan_geometry",
+    "message": "方案切割线未通过导出前几何校验，未生成任何 G-code",
+    "violations": [
+      {"panel_no": 1, "step": 1, "code": "cut_outside_board",
+       "message": "切割线 (150.0, 0.0)->(150.0, 100.0) 超出母板 100.0 x 100.0"}
+    ]
+  }
+}
+```
+
+`violations[].code` 取值：`cut_outside_board` / `cut_not_spanning_region` /
+`region_outside_board` / `non_sequential_steps` / `invalid_axis` /
+`invalid_length` / `invalid_region` / `invalid_cut`。
+
 ### `GET /health`
 
 返回 `{"status":"ok"}`，供容器健康检查与负载均衡探活。
@@ -209,13 +313,14 @@ placed_parts / unplaced_parts`）及 `total`。
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（创建/查询/列表/健康检查）+ 启动建库
+│   ├── main.py          # FastAPI 路由（创建/查询/列表/G-code 导出/健康检查）+ 启动建库
 │   ├── models.py        # 请求/响应 Pydantic 模型与参数校验
 │   ├── nesting.py       # 直切排样核心算法 + 几何自检 + 响应装配
+│   ├── gcode.py         # G-code 导出：坐标变换、导出前校验、确定性文本生成
 │   ├── services.py      # 业务编排、幂等落库
 │   ├── database.py      # SQLite 连接、建表、plan_id 摘要、CRUD
 │   └── init_db.py       # python -m app.init_db 建库入口
-├── tests/               # unittest：核心算法/随机不变量/持久化幂等/API 端到端
+├── tests/               # unittest：核心算法/随机不变量/持久化幂等/G-code/API 端到端
 ├── entrypoint.sh        # 容器启动：建库 + uvicorn（一条命令）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -231,4 +336,5 @@ python3 -m unittest discover -s tests -v
 
 测试覆盖：恰好放满、锯缝切分、旋转启用/禁用、母板上限、超大件、编号连续、
 零锯缝铺满、**300 组随机算例的贯穿切模拟与面积/重叠/数量不变量**、
-结果稳定性（含输入乱序）、SQLite 幂等存取，以及基于 TestClient 的 HTTP 端到端。
+结果稳定性（含输入乱序）、SQLite 幂等存取、**G-code 坐标变换/确定性/行号映射/
+总长/导出前校验**，以及基于 TestClient 的 HTTP 端到端。

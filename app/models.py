@@ -112,5 +112,34 @@ class PlanListResponse(BaseModel):
     plans: list[PlanSummary]
 
 
+class GcodeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    origin: Literal["top_left", "top_right", "bottom_left", "bottom_right"] = (
+        Field(..., description="机床原点所在的母板角"))
+    unit: Literal["mm", "in"] = Field(
+        ..., description="输出单位：mm=G21，in=G20")
+    safe_z: float = Field(
+        ..., gt=0, le=100_000, description="安全抬刀高度（按 unit 计）")
+
+
+class GcodeCutMapEntry(BaseModel):
+    panel_no: int
+    step: int
+    line: int = Field(..., description="该刀 G1 切割移动所在行号，从 1 开始")
+
+
+class GcodeResponse(BaseModel):
+    plan_id: str
+    origin: str
+    unit: str
+    safe_z: float
+    line_count: int
+    total_cut_length: float = Field(
+        ..., description="全部切割线长度之和（按 unit 计）")
+    cut_map: list[GcodeCutMapEntry]
+    gcode: str
+
+
 class HealthOut(BaseModel):
     status: str
